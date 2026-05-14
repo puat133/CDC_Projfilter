@@ -200,7 +200,7 @@ For historical reference, see git tag `before-sos-removal`.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+see [LICENSE](LICENSE) for details.
 
 ## Authors
 
