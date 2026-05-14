@@ -19,7 +19,7 @@ from cd_filtering.cd_proj_conjugate import proj_error_norm_square_hist_scan
 from exponential_family.n_d_ef_spg import NDExponentialFamilySPG
 from utils.hdf_io import save_to_hdf
 import diffrax as dfx
-from simulation.configs import SimulationConfig, EnKFConfig, ParticleFilterConfig, ProjectionFilterConfig
+from simulation.configs import SimulationConfig, EnKFConfig, ParticleFilterConfig, ProjectionFilterConfig, HGMFConfig
 from simulation.dynamical_system import DynamicalSystem
 from simulation.post_analysis import post_analysis
 import simulation.runs as runs
@@ -229,6 +229,7 @@ def simulate_benchmark(
         covs_gm_init: Array,
         weights_gm_init: Array,
         logger:logging.Logger,
+        hgmf_config: HGMFConfig | None = None,
 )-> dict:
     """
     Benchmark filtering techniques without running the projection filter.
@@ -400,6 +401,24 @@ def simulate_benchmark(
                 pgm_em_cost_analysis["corrected_flops"]
             ))
 
+        if hgmf_config is None:
+            hgmf_config = HGMFConfig()
+        logger.info("Running HGMF...")
+        hgmf_results, hgmf_cost_analysis, execution_time_hgmf = runs.run_hgmf(
+            sim_config,
+            dynamic,
+            measurement_record,
+            means_gm_init,
+            covs_gm_init,
+            log_weights_gm_init,
+            hgmf_config,
+        )
+        logger.info(
+            "Completed running HGMF. Execution time = {:.3e} seconds - Flops = {:.3e}".format(
+                execution_time_hgmf.total_seconds(),
+                hgmf_cost_analysis["corrected_flops"]
+            ))
+
         logger.info("Doing post analysis.")
         results = post_analysis(dynamic,
                                 sim_config,
@@ -423,6 +442,7 @@ def simulate_benchmark(
                                 sp_gsf_results=sp_gsf_results,
                                 pgm_results=pgm_results,
                                 pgm_em_results=pgm_em_results,
+                                hgmf_results=hgmf_results,
                                 x_meas=x_integrated[1:]
                                 )
 
@@ -474,6 +494,7 @@ def simulate_fully(
         weights_gm_init: Array,
         logger:logging.Logger,
         progress_bar_type:str,
+        hgmf_config: HGMFConfig | None = None,
 )-> dict:
     """
     Simulate the dynamical system using various filtering techniques.
@@ -702,6 +723,24 @@ def simulate_fully(
                 pgm_em_cost_analysis["corrected_flops"]
             ))
 
+        if hgmf_config is None:
+            hgmf_config = HGMFConfig()
+        logger.info("Running HGMF...")
+        hgmf_results, hgmf_cost_analysis, execution_time_hgmf = runs.run_hgmf(
+            sim_config,
+            dynamic,
+            measurement_record,
+            means_gm_init,
+            covs_gm_init,
+            log_weights_gm_init,
+            hgmf_config,
+        )
+        logger.info(
+            "Completed running HGMF. Execution time = {:.3e} seconds - Flops = {:.3e}".format(
+                execution_time_hgmf.total_seconds(),
+                hgmf_cost_analysis["corrected_flops"]
+            ))
+
         logger.info("Doing post analysis.")
         results = post_analysis(dynamic,
                                 sim_config,
@@ -725,6 +764,7 @@ def simulate_fully(
                                 sp_gsf_results=sp_gsf_results,
                                 pgm_results=pgm_results,
                                 pgm_em_results=pgm_em_results,
+                                hgmf_results=hgmf_results,
                                 x_meas=x_integrated[1:],
                                 theta_indices_for_mean=proj_config.theta_indices_for_bijection_params[0]
                                 )
@@ -760,3 +800,88 @@ def simulate_fully(
         raise
 
     return results
+
+
+def simulate_hgmf_only(
+        dynamic: DynamicalSystem,
+        sim_config: SimulationConfig,
+        init_state: Array,
+        init_samples: Array,
+        means_gm_init: Array,
+        covs_gm_init: Array,
+        weights_gm_init: Array,
+        logger: logging.Logger,
+        hgmf_config: HGMFConfig | None = None,
+) -> dict:
+    """Run ONLY the Homotopic Gaussian Mixture Filter for the given seed.
+
+    Measurement record is generated deterministically from sim_config.seed
+    (same path as simulate_benchmark / simulate_fully), so the resulting
+    HGMF posterior trajectory aligns with the existing BENCHMARK_ONLY outputs
+    for the same seed and can be compared post-hoc.
+
+    Saves to sim_config.sim_path / "variables.hdf" a payload that contains:
+        - the measurement record and ground-truth trajectory,
+        - the initial-prior GM parameters (means, covs, log_weights),
+        - the HGMF result tuple (means_hist, covs_hist, log_weights_hist),
+        - cost analysis, execution time, and the configs.
+    """
+    classes = [SimulationConfig, HGMFConfig, DynamicalSystem, dfx.Solution, list, tuple, dict]
+
+    try:
+        logger.info("Initialization (HGMF-only)...")
+
+        t_s = 0
+        t_span = jnp.linspace(t_s, sim_config.t_f, sim_config.n_meas + 1)
+        prng_key = jrandom.PRNGKey(sim_config.seed)
+        prng_key, sub_key = jrandom.split(prng_key)
+
+        # Same measurement-generation path as simulate_benchmark — same seed
+        # therefore yields the same measurement record.
+        x_integrated, measurement_record, t_meas, time_sample = \
+            dynamic.generate_path_and_measurement(init_state,
+                                                  t_span,
+                                                  sim_config.dt,
+                                                  sub_key)
+
+        if hgmf_config is None:
+            hgmf_config = HGMFConfig()
+
+        log_weights_gm_init = jnp.log(weights_gm_init)
+
+        logger.info("Running HGMF...")
+        hgmf_results, hgmf_cost_analysis, execution_time_hgmf = runs.run_hgmf(
+            sim_config,
+            dynamic,
+            measurement_record,
+            means_gm_init,
+            covs_gm_init,
+            log_weights_gm_init,
+            hgmf_config,
+        )
+        logger.info(
+            "Completed running HGMF. Execution time = {:.3e} seconds - Flops = {:.3e}".format(
+                execution_time_hgmf.total_seconds(),
+                hgmf_cost_analysis["corrected_flops"]
+            ))
+
+        nan_presence = jnp.any(jnp.isnan(hgmf_results[0]))
+        logger.info("NaN values presence in HGMF results: {}".format(bool(nan_presence)))
+
+        if sim_config.save and not nan_presence:
+            logger.info("Saving variables to hdf file...")
+            save_to_hdf(sim_config.sim_path / "variables.hdf",
+                        locals(),
+                        classes=classes,
+                        excluded_vars=['init_samples'])
+
+        logger.info("Completed (HGMF-only). Enjoy.")
+        return {
+            "hgmf_results": hgmf_results,
+            "hgmf_cost_analysis": hgmf_cost_analysis,
+            "execution_time_hgmf": execution_time_hgmf,
+            "measurement_record": measurement_record,
+        }
+    except Exception as e:
+        logger.exception(str(e))
+        raise

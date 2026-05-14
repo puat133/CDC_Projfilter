@@ -36,6 +36,7 @@ def post_analysis(dynamic: DynamicalSystem,
                  sp_gsf_results: Optional[Tuple] = None,
                  pgm_results: Optional[Tuple] = None,
                  pgm_em_results: Optional[Tuple] = None,
+                 hgmf_results: Optional[Tuple] = None,
                  x_meas: Optional[Array] = None,
                  theta_indices_for_mean: Optional[Array] = None,
                  ) -> Dict[str, Array]:
@@ -91,7 +92,7 @@ def post_analysis(dynamic: DynamicalSystem,
                 theta_init, params_init, x_particle_posterior_history,
                 x_particle_prior_history, enkf_particle_posterior_history,
                 cdf_results, gsf_results, sp_gsf_results, pgm_results,
-                pgm_em_results, x_meas, theta_indices_for_mean,
+                pgm_em_results, hgmf_results, x_meas, theta_indices_for_mean,
                 logger,sim_config.save_particle_samples,sim_config.n_sw_projection, sim_config.n_ef_samples)
         else:
             return _post_analysis_full(
@@ -100,7 +101,7 @@ def post_analysis(dynamic: DynamicalSystem,
                 theta_init, params_init, x_particle_posterior_history,
                 x_particle_prior_history, enkf_particle_posterior_history,
                 cdf_results, gsf_results, sp_gsf_results, pgm_results,
-                pgm_em_results, x_meas, logger)
+                pgm_em_results, hgmf_results, x_meas, logger)
 
 def _extract_parameters(cdf_results, time_index, theta_init, params_init):
     """Extract theta and params from cdf_results at given time index.
@@ -357,6 +358,7 @@ def _post_analysis_full(dynamic: DynamicalSystem,
                        sp_gsf_results: Any,
                        pgm_results: Any,
                        pgm_em_results: Any,
+                       hgmf_results: Any,
                        x_meas: Array,
                        logger: logging.Logger) -> Dict[str, Array]:
     """Perform comprehensive post-analysis across all filter types.
@@ -404,7 +406,8 @@ def _post_analysis_full(dynamic: DynamicalSystem,
     cross_entropy_hist_sp_gsf = []
     cross_entropy_hist_pgm = []
     cross_entropy_hist_pgm_2 = []
-    
+    cross_entropy_hist_hgmf = []
+
     density_hist_pred = []
     density_hist_post = []
     density_particle_hist_pred = []
@@ -414,7 +417,8 @@ def _post_analysis_full(dynamic: DynamicalSystem,
     density_pgm_hist_post = []
     density_pgm_2_hist_post = []
     density_enkf_hist_post = []
-    
+    density_hgmf_hist_post = []
+
     hell_dist_hist_post = []
     hell_dist_hist_pred = []
     hell_dist_hist_gsf = []
@@ -422,6 +426,11 @@ def _post_analysis_full(dynamic: DynamicalSystem,
     hell_dist_hist_pgm = []
     hell_dist_hist_pgm_2 = []
     hell_dist_hist_enkf = []
+    hell_dist_hist_hgmf = []
+
+    hgmf_available = (
+        hgmf_results is not None and len(hgmf_results) > 0 and len(hgmf_results[0]) > 0
+    )
 
     num_points = jnp.array([sim_config.n_point_per_axis, sim_config.n_point_per_axis], dtype=jnp.int32)
     n_timesteps = measurement_record.shape[0] + 1
@@ -452,6 +461,10 @@ def _post_analysis_full(dynamic: DynamicalSystem,
             means_pgm_2 = means_gm_init
             covs_pgm_2 = covs_gm_init
             log_weights_pgm_2 = log_weights_gm_init
+
+            means_hgmf = means_gm_init
+            covs_hgmf = covs_gm_init
+            log_weights_hgmf = log_weights_gm_init
         else:
             # Get particle samples from history
             samples_post = x_particle_posterior_history[time_index - 1]
@@ -496,6 +509,17 @@ def _post_analysis_full(dynamic: DynamicalSystem,
                 covs_pgm_2 = jnp.full((num_clusters, dynamic.dim_states, dynamic.dim_states), jnp.nan)
                 log_weights_pgm_2 = jnp.full(num_clusters, jnp.nan)
 
+            # Handle HGMF results - use NaN if absent
+            if hgmf_available:
+                means_hgmf = hgmf_results[0][time_index - 1]
+                covs_hgmf = hgmf_results[1][time_index - 1]
+                log_weights_hgmf = hgmf_results[2][time_index - 1]
+            else:
+                num_clusters = means_gm_init.shape[0]
+                means_hgmf = jnp.full((num_clusters, dynamic.dim_states), jnp.nan)
+                covs_hgmf = jnp.full((num_clusters, dynamic.dim_states, dynamic.dim_states), jnp.nan)
+                log_weights_hgmf = jnp.full(num_clusters, jnp.nan)
+
         # Calculate grid info from particles
         grid_limits_post_particle, post_bins, dxs_post = _get_particles_grid_info(samples_post, sim_config)
         grid_limits_pred_particle, pred_bins, dxs_pred = _get_particles_grid_info(samples_pred, sim_config)
@@ -535,8 +559,13 @@ def _post_analysis_full(dynamic: DynamicalSystem,
         )
         
         density_pgm_2 = dm.mix_gaussian_densities_on_grid(
-            grid_limits_post_particle, sim_config.n_point_per_axis, 
+            grid_limits_post_particle, sim_config.n_point_per_axis,
             log_weights_pgm_2, means_pgm_2, covs_pgm_2
+        )
+
+        density_hgmf = dm.mix_gaussian_densities_on_grid(
+            grid_limits_post_particle, sim_config.n_point_per_axis,
+            log_weights_hgmf, means_hgmf, covs_hgmf
         )
 
         # Calculate divergence metrics
@@ -568,6 +597,8 @@ def _post_analysis_full(dynamic: DynamicalSystem,
             dm.gaussian_mixture_cross_entropy(samples_post, means_pgm, covs_pgm, log_weights_pgm))
         cross_entropy_hist_pgm_2.append(
             dm.gaussian_mixture_cross_entropy(samples_post, means_pgm_2, covs_pgm_2, log_weights_pgm_2))
+        cross_entropy_hist_hgmf.append(
+            dm.gaussian_mixture_cross_entropy(samples_post, means_hgmf, covs_hgmf, log_weights_hgmf))
 
         # Store density results
         if analyze_cdf_result:
@@ -580,6 +611,7 @@ def _post_analysis_full(dynamic: DynamicalSystem,
         density_pgm_hist_post.append(density_pgm)
         density_pgm_2_hist_post.append(density_pgm_2)
         density_enkf_hist_post.append(density_enkf_post)
+        density_hgmf_hist_post.append(density_hgmf)
 
         # Calculate Hellinger distances
         if analyze_cdf_result:
@@ -590,6 +622,7 @@ def _post_analysis_full(dynamic: DynamicalSystem,
         hell_dist_hist_pgm.append(dm.hellinger_distance(density_particle_post, density_pgm, dxs_post))
         hell_dist_hist_pgm_2.append(dm.hellinger_distance(density_particle_post, density_pgm_2, dxs_post))
         hell_dist_hist_enkf.append(dm.hellinger_distance(density_particle_post, density_enkf_post, dxs_post))
+        hell_dist_hist_hgmf.append(dm.hellinger_distance(density_particle_post, density_hgmf, dxs_post))
 
         # Store grid info
         grid_limits_hist_post.append(grid_limits_post_particle)
@@ -613,6 +646,7 @@ def _post_analysis_full(dynamic: DynamicalSystem,
         "cross_entropy_hist_sp_gsf": jnp.stack(cross_entropy_hist_sp_gsf),
         "cross_entropy_hist_pgm": jnp.stack(cross_entropy_hist_pgm),
         "cross_entropy_hist_pgm_2": jnp.stack(cross_entropy_hist_pgm_2),
+        "cross_entropy_hist_hgmf": jnp.stack(cross_entropy_hist_hgmf),
         "density_hist_pred": jnp.stack(density_hist_pred) if density_hist_pred else None,
         "density_hist_post": jnp.stack(density_hist_post) if density_hist_post else None,
         "density_particle_hist_pred": jnp.stack(density_particle_hist_pred),
@@ -622,6 +656,7 @@ def _post_analysis_full(dynamic: DynamicalSystem,
         "density_pgm_hist_post": jnp.stack(density_pgm_hist_post),
         "density_pgm_2_hist_post": jnp.stack(density_pgm_2_hist_post),
         "density_enkf_hist_post": jnp.stack(density_enkf_hist_post),
+        "density_hgmf_hist_post": jnp.stack(density_hgmf_hist_post),
         "hell_dist_hist_post": jnp.stack(hell_dist_hist_post) if hell_dist_hist_post else None,
         "hell_dist_hist_pred": jnp.stack(hell_dist_hist_pred) if hell_dist_hist_pred else None,
         "hell_dist_hist_gsf": jnp.stack(hell_dist_hist_gsf),
@@ -629,6 +664,7 @@ def _post_analysis_full(dynamic: DynamicalSystem,
         "hell_dist_hist_pgm": jnp.stack(hell_dist_hist_pgm),
         "hell_dist_hist_pgm_2": jnp.stack(hell_dist_hist_pgm_2),
         "hell_dist_hist_enkf": jnp.stack(hell_dist_hist_enkf),
+        "hell_dist_hist_hgmf": jnp.stack(hell_dist_hist_hgmf),
         "grid_limits_hist_post": jnp.stack(grid_limits_hist_post),
         "grid_limits_hist_pred": jnp.stack(grid_limits_hist_pred),
         "grid_hist_post": jnp.stack(grid_hist_post) if grid_hist_post else None,
@@ -662,6 +698,7 @@ def _post_analysis_full_for_high_dim(dynamic: DynamicalSystem,
                                 sp_gsf_results: Any,
                                 pgm_results: Any,
                                 pgm_em_results: Any,
+                                hgmf_results: Any,
                                 x_meas: Array,
                                 theta_indices_for_mean: Array,
                                 logger: logging.Logger,
@@ -806,6 +843,19 @@ def _post_analysis_full_for_high_dim(dynamic: DynamicalSystem,
             nan_logweights = jnp.full((n_timesteps, num_clusters), jnp.nan)
             all_means_pgm_2, all_covs_pgm_2, all_logweights_pgm_2 = nan_means, nan_covs, nan_logweights
 
+    # Stack HGMF parameters (with NaN handling)
+    hgmf_available_hd = hgmf_results is not None and len(hgmf_results) > 0 and len(hgmf_results[0]) > 0
+    if hgmf_available_hd:
+        all_means_hgmf = jnp.concatenate([means_gm_init[None], hgmf_results[0]], axis=0)
+        all_covs_hgmf = jnp.concatenate([covs_gm_init[None], hgmf_results[1]], axis=0)
+        all_logweights_hgmf = jnp.concatenate([log_weights_gm_init[None], hgmf_results[2]], axis=0)
+    else:
+        logger.warning("HGMF results are empty, using NaN placeholders for all timesteps")
+        nan_means_hgmf = jnp.full((n_timesteps, num_clusters, dynamic.dim_states), jnp.nan)
+        nan_covs_hgmf = jnp.full((n_timesteps, num_clusters, dynamic.dim_states, dynamic.dim_states), jnp.nan)
+        nan_logweights_hgmf = jnp.full((n_timesteps, num_clusters), jnp.nan)
+        all_means_hgmf, all_covs_hgmf, all_logweights_hgmf = nan_means_hgmf, nan_covs_hgmf, nan_logweights_hgmf
+
     # Stack CDF results if available
     if analyze_cdf_result:
         all_theta_post = jnp.vstack([theta_init[None, :], cdf_results[0]])
@@ -898,7 +948,10 @@ def _post_analysis_full_for_high_dim(dynamic: DynamicalSystem,
     # Seeds for SW distance (as JAX array - this is the key fix!)
     seeds = jnp.arange(n_timesteps)
 
-    # Keys for sampling (one per timestep per method)
+    # Keys for sampling (one per timestep per method). Original 7-key derivation
+    # is preserved so previously saved sw1_dist_hist_* numbers remain bit-exact
+    # reproducible. The HGMF key is derived independently from a separate base
+    # key so adding it does not perturb the older methods' samples.
     all_keys = jrandom.split(base_key, n_timesteps * 7).reshape(7, n_timesteps, 2)
     keys_gsf = all_keys[0]
     keys_sp_gsf = all_keys[1]
@@ -906,6 +959,9 @@ def _post_analysis_full_for_high_dim(dynamic: DynamicalSystem,
     keys_pgm_2 = all_keys[3]
     keys_ef_post = all_keys[4]
     keys_ef_pred = all_keys[5]
+    # Independent base for HGMF so it does not change the other methods' keys.
+    base_key_hgmf = jrandom.PRNGKey(sim_config.seed + 1000 + 7777)
+    keys_hgmf = jrandom.split(base_key_hgmf, n_timesteps).reshape(n_timesteps, 2)
 
     logger.info("Post-analysis (high-dim): Step 3/5 - PRNG keys generated")
 
@@ -930,6 +986,8 @@ def _post_analysis_full_for_high_dim(dynamic: DynamicalSystem,
         all_post_samples, all_means_pgm, all_covs_pgm, all_logweights_pgm)
     cross_entropy_hist_pgm_2 = compute_all_gm_cross_entropy(
         all_post_samples, all_means_pgm_2, all_covs_pgm_2, all_logweights_pgm_2)
+    cross_entropy_hist_hgmf = compute_all_gm_cross_entropy(
+        all_post_samples, all_means_hgmf, all_covs_hgmf, all_logweights_hgmf)
 
     # Sample from all GMs (one call per method, all timesteps)
     logger.info("Post-analysis (high-dim): Step 4/5 - Sampling from Gaussian mixtures...")
@@ -937,6 +995,7 @@ def _post_analysis_full_for_high_dim(dynamic: DynamicalSystem,
     all_sp_gsf_samples = sample_all_gm(all_means_sp_gsf, all_covs_sp_gsf, jnp.exp(all_logweights_sp_gsf), keys_sp_gsf)
     all_pgm_samples = sample_all_gm(all_means_pgm, all_covs_pgm, jnp.exp(all_logweights_pgm), keys_pgm)
     all_pgm_2_samples = sample_all_gm(all_means_pgm_2, all_covs_pgm_2, jnp.exp(all_logweights_pgm_2), keys_pgm_2)
+    all_hgmf_samples = sample_all_gm(all_means_hgmf, all_covs_hgmf, jnp.exp(all_logweights_hgmf), keys_hgmf)
 
     # Compute SW distances (one call per comparison, all timesteps)
     # Use subsampled arrays for memory efficiency
@@ -946,6 +1005,7 @@ def _post_analysis_full_for_high_dim(dynamic: DynamicalSystem,
     sw1_dist_hist_pgm = compute_all_sw_distances(all_post_samples_sub, all_pgm_samples, seeds)
     sw1_dist_hist_pgm_2 = compute_all_sw_distances(all_post_samples_sub, all_pgm_2_samples, seeds)
     sw1_dist_hist_enkf = compute_all_sw_distances(all_post_samples_sub, all_enkf_samples_sub, seeds)
+    sw1_dist_hist_hgmf = compute_all_sw_distances(all_post_samples_sub, all_hgmf_samples, seeds)
 
     # CDF-specific computations
     if analyze_cdf_result:
@@ -984,6 +1044,7 @@ def _post_analysis_full_for_high_dim(dynamic: DynamicalSystem,
         "cross_entropy_hist_sp_gsf": cross_entropy_hist_sp_gsf,
         "cross_entropy_hist_pgm": cross_entropy_hist_pgm,
         "cross_entropy_hist_pgm_2": cross_entropy_hist_pgm_2,
+        "cross_entropy_hist_hgmf": cross_entropy_hist_hgmf,
         "sw1_dist_hist_post": sw1_dist_hist_post if analyze_cdf_result else None,
         "sw1_dist_hist_pred": sw1_dist_hist_pred if analyze_cdf_result else None,
         "sw1_dist_hist_gsf": sw1_dist_hist_gsf,
@@ -991,6 +1052,7 @@ def _post_analysis_full_for_high_dim(dynamic: DynamicalSystem,
         "sw1_dist_hist_pgm": sw1_dist_hist_pgm,
         "sw1_dist_hist_pgm_2": sw1_dist_hist_pgm_2,
         "sw1_dist_hist_enkf": sw1_dist_hist_enkf,
+        "sw1_dist_hist_hgmf": sw1_dist_hist_hgmf,
     }
 
     # Add samples if requested

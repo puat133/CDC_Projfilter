@@ -46,6 +46,10 @@ notebook = [
 ]
 viz = [
     "seaborn>=0.11.1",
+    # GUI editor for matplotlib figure pickles produced by
+    # utils/fig_pickle.py. Requires Python >=3.11, so this extra is a
+    # no-op on Python 3.10 installs.
+    "figureforge>=0.3.3",
 ]
 
 [tool.setuptools]

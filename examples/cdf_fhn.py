@@ -37,10 +37,12 @@ from simulation.configs import (
     EnKFConfig,
     ParticleFilterConfig,
     ProjectionFilterConfig,
+    HGMFConfig,
     Simulation_Case,
 )
 from simulation.dynamical_system import DynamicalSystem
-from simulation.simulation import simulate_fully, simulate_projection_filter_only, simulate_benchmark
+from simulation.simulation import (simulate_fully, simulate_projection_filter_only,
+                                   simulate_benchmark, simulate_hgmf_only)
 
 # FitzHugh-Nagumo default parameters
 DEFAULT_A = 0.7
@@ -136,8 +138,21 @@ if __name__ == "__main__":
     )
     parser.add_argument("--pgm_samples", default=DEFAULT_N_PGM_SMPLS, type=int, help="Number of pgm samples")
     parser.add_argument("--pgm_clusters", default=DEFAULT_PGM_CLSTR, type=int, help="Number of pgm clusters")
+    parser.add_argument("--hgmf_sp_order", default=5, type=int,
+                        help="HGMF prediction sigma-point order (Gauss-Hermite)")
+    parser.add_argument("--hgmf_eps", default=1e-3, type=float,
+                        help="HGMF log-homotopy epsilon (Corollary 5)")
+    parser.add_argument("--hgmf_rtol_hom", default=1e-3, type=float,
+                        help="HGMF homotopic-correction PID rtol")
+    parser.add_argument("--hgmf_atol_hom", default=1e-6, type=float,
+                        help="HGMF homotopic-correction PID atol")
+    parser.add_argument("--hgmf_dt_hom", default=1e-2, type=float,
+                        help="HGMF homotopic-correction initial step size")
+    add_boolean_argument(parser, "hgmf_log_homotopy", default=True,
+                         messages="whether to integrate the HGMF correction in tau = log(s + eps) instead of s.")
     parser.add_argument(
-        "--sim_case", default=1, type=int, help="1 - Projection Filter Only, " "2 - Benchmark Only, 3 - Full"
+        "--sim_case", default=1, type=int,
+        help="1 - Projection Filter Only, 2 - Benchmark Only, 3 - Full, 4 - HGMF Only"
     )
 
     parser.add_argument(
@@ -168,7 +183,10 @@ if __name__ == "__main__":
     simulation_time_string = datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
     simulation_id = "FHN_SEED_{}_".format(args.seed) + simulation_time_string
     sim_case = Simulation_Case(args.sim_case)
-    sim_path = pathlib.Path(f'./simulation_result/FHN-{args.max_order_monomials}-{str(sim_case)}-F_MIN_EV_{args.min_fisher_ev}-MAX_DTHETA_DT_{args.max_d_theta_dt_norm}-TF_{args.tf}-NMEAS_{args.n_meas}/{simulation_id}')
+    if sim_case == Simulation_Case.HGMF_ONLY:
+        sim_path = pathlib.Path(f'./simulation_result/FHN-{args.max_order_monomials}-{str(sim_case)}-TF_{args.tf}-NMEAS_{args.n_meas}/{simulation_id}')
+    else:
+        sim_path = pathlib.Path(f'./simulation_result/FHN-{args.max_order_monomials}-{str(sim_case)}-F_MIN_EV_{args.min_fisher_ev}-MAX_DTHETA_DT_{args.max_d_theta_dt_norm}-TF_{args.tf}-NMEAS_{args.n_meas}/{simulation_id}')
 
     if not sim_path.exists():
         sim_path.mkdir(parents=True, exist_ok=True)
@@ -205,6 +223,17 @@ if __name__ == "__main__":
     enkf_config = EnKFConfig(
         n_particle_per_device=args.n_particle,
     )
+
+    hgmf_config = HGMFConfig(sp_order=args.hgmf_sp_order,
+                             use_log_homotopy=args.hgmf_log_homotopy,
+                             log_homotopy_eps=args.hgmf_eps,
+                             rtol_pred=DEFAULT_RTOL,
+                             atol_pred=DEFAULT_ATOL,
+                             rtol_hom=args.hgmf_rtol_hom,
+                             atol_hom=args.hgmf_atol_hom,
+                             dt_pred=args.dt,
+                             dt_hom=args.hgmf_dt_hom,
+                             constant_step_size=args.constant_step_size)
 
     # set FHN parameters
     a_fhn = args.a
@@ -461,7 +490,8 @@ if __name__ == "__main__":
             means_gm_init,
             covs_gm_init,
             weights_gm_init,
-            logger
+            logger,
+            hgmf_config=hgmf_config,
         )
     elif sim_config.sim_case == Simulation_Case.FULL:
         simulation_result = simulate_fully(
@@ -477,7 +507,20 @@ if __name__ == "__main__":
             covs_gm_init,
             weights_gm_init,
             logger,
-            progress_bar_type
+            progress_bar_type,
+            hgmf_config=hgmf_config,
+        )
+    elif sim_config.sim_case == Simulation_Case.HGMF_ONLY:
+        simulation_result = simulate_hgmf_only(
+            dynamic,
+            sim_config,
+            init_state,
+            init_samples,
+            means_gm_init,
+            covs_gm_init,
+            weights_gm_init,
+            logger,
+            hgmf_config=hgmf_config,
         )
     else:
         print("Unknown simulation case")

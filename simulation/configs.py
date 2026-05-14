@@ -9,7 +9,8 @@ from enum import Enum
 
 Simulation_Case = Enum('Simulation_Case', [('PROJECTION_FILTER_ONLY', 1),
                                            ('BENCHMARK_ONLY', 2),
-                                           ('FULL', 3)])
+                                           ('FULL', 3),
+                                           ('HGMF_ONLY', 4)])
 
 @chex.dataclass
 class SimulationConfig:
@@ -46,6 +47,26 @@ class ParticleFilterConfig:
 @chex.dataclass
 class EnKFConfig:
     n_particle_per_device: int = int(1e4)
+
+
+@chex.dataclass
+class HGMFConfig:
+    """Configuration for the Homotopic Gaussian Mixture Filter.
+
+    The HGMF reuses the sigma-point Gaussian flow for prediction (over physical
+    time t) and integrates a per-component homotopic ODE in s in [0, 1] for the
+    update (Craft & DeMars 2025).
+    """
+    sp_order: int = 5
+    use_log_homotopy: bool = True
+    log_homotopy_eps: float = 1e-3
+    rtol_pred: float = 1e-3
+    atol_pred: float = 1e-6
+    rtol_hom: float = 1e-3
+    atol_hom: float = 1e-6
+    dt_pred: float = 1e-3
+    dt_hom: float = 1e-2
+    constant_step_size: bool = False
 
 # TODO: Define QuadratureConfig data class
 # @chex.dataclass

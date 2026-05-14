@@ -17,11 +17,12 @@ from other_filter.cd_pgm import cd_pgm_optimized as cd_pgm, create_pgm_drift_for
 from other_filter.cd_pgm_em import cd_pgm as cd_pgm_em, create_pgm_em_drift_for_cost_analysis, \
     create_pgm_em_update_for_cost_analysis
 from other_filter.cd_sp_kf import cd_sp_gsf, create_spkf_ode_for_cost_analysis, create_spgsf_update_for_cost_analysis
+from other_filter.cd_hgmf import cd_hgmf, create_hgmf_pred_ode_for_cost_analysis, create_hgmf_update_for_cost_analysis
 from other_filter.particlefilter_cont_discrete import ContinuousDiscreteParticleFilter, \
     create_particle_drift_for_cost_analysis, create_particle_update_for_cost_analysis
 from sigma_points.gauss_hermite import GaussHermiteSigmaPoints
 from simulation.configs import SimulationConfig, ProjectionFilterConfig, ParticleFilterConfig, \
-    EnKFConfig
+    EnKFConfig, HGMFConfig
 from simulation.dynamical_system import DynamicalSystem
 from symbolic.sympy_to_jax import sympy_matrix_to_jax
 from cd_filtering.cd_proj_conjugate import get_theta_ell, cd_conj_proj_filter_chol,\
@@ -588,6 +589,57 @@ def compute_decomposed_flops_pgm_em(
         "min_ode_steps_per_meas": min_sde_steps,
         "max_ode_steps_per_meas": max_sde_steps,
         "ode_to_bayesian_ratio": flops_sde_total / flops_update_total if flops_update_total > 0 else float('inf'),
+    }
+
+
+def compute_decomposed_flops_hgmf(
+    pred_ode_derivative_fn: Callable,
+    sample_pred_states: tuple,
+    hom_update_fn: Callable,
+    sample_means: Array,
+    sample_covs: Array,
+    sample_log_weights: Array,
+    sample_meas: Array,
+    n_meas: int,
+    pred_sol_stats: dict,
+    hom_sol_stats: dict,
+) -> dict:
+    """Compute FLOPS for the Homotopic Gaussian Mixture Filter (HGMF).
+
+    The HGMF has two integrations per measurement: a Gaussian-flow prediction
+    over physical time and a homotopic correction over s in [0, 1]. The number
+    of steps for both is read from the diffrax solution statistics.
+    """
+    compiled_pred = pred_ode_derivative_fn.lower(0.0, sample_pred_states, None).compile()
+    flops_per_pred_step = compiled_pred.compiled.cost_analysis()[0].get("flops", float('nan'))
+
+    compiled_update = hom_update_fn.lower(sample_means, sample_covs, sample_log_weights, sample_meas).compile()
+    flops_update = compiled_update.compiled.cost_analysis()[0].get("flops", float('nan'))
+
+    pred_steps_per_meas = pred_sol_stats['num_steps']
+    total_pred_steps = int(jnp.sum(pred_steps_per_meas))
+    mean_pred_steps = float(jnp.mean(pred_steps_per_meas))
+
+    hom_steps_per_meas = hom_sol_stats['num_steps']
+    total_hom_steps = int(jnp.sum(hom_steps_per_meas))
+    mean_hom_steps = float(jnp.mean(hom_steps_per_meas))
+
+    flops_pred_total = flops_per_pred_step * total_pred_steps
+    flops_update_total = flops_update * n_meas  # update is one diffeqsolve call per meas
+    corrected_flops = flops_pred_total + flops_update_total
+
+    return {
+        "flops_per_ode_step": flops_per_pred_step,
+        "flops_bayesian_per_meas": flops_update,
+        "flops_ode_total": flops_pred_total,
+        "flops_bayesian_total": flops_update_total,
+        "corrected_flops": corrected_flops,
+        "n_meas": n_meas,
+        "total_ode_steps": total_pred_steps,
+        "mean_ode_steps_per_meas": mean_pred_steps,
+        "total_hom_steps": total_hom_steps,
+        "mean_hom_steps_per_meas": mean_hom_steps,
+        "ode_to_bayesian_ratio": flops_pred_total / flops_update_total if flops_update_total > 0 else float('inf'),
     }
 
 
@@ -1378,3 +1430,114 @@ def run_pgm_em(sim_config:SimulationConfig,
         execution_time_pgm_em = timedelta(0)
 
         return pgm_em_results, pgm_em_cost_analysis, execution_time_pgm_em
+
+
+def run_hgmf(
+    sim_config: SimulationConfig,
+    dynamic: DynamicalSystem,
+    measurements: Array,
+    means_gsf_init: Array,
+    covs_gsf_init: Array,
+    log_weights_gsf_init: Array,
+    hgmf_config: HGMFConfig,
+):
+    """Run the Homotopic Gaussian Mixture Filter (Craft & DeMars 2025).
+
+    Parameters
+    ----------
+    sim_config
+        Simulation configuration.
+    dynamic
+        DynamicalSystem object.
+    measurements
+        Measurement sequence, shape (n_meas, dim_meas).
+    means_gsf_init, covs_gsf_init, log_weights_gsf_init
+        Initial GM parameters (same shapes used by the GSF / SP-GSF benchmarks).
+    hgmf_config
+        HGMF configuration (HGMFConfig).
+
+    Returns
+    -------
+    (hgmf_results, hgmf_cost_analysis, execution_time_hgmf)
+
+    where ``hgmf_results`` is the 3-tuple ``(means_hist, covs_hist, log_weights_hist)``.
+    """
+    sp = GaussHermiteSigmaPoints(n_state=dynamic.dim_states, order=hgmf_config.sp_order)
+    meas_cov = dynamic.parameters['sigma_v'] ** 2 * jnp.eye(dynamic.dim_output)
+
+    compiled_hgmf = cd_hgmf.lower(
+        dynamic.drift,
+        dynamic.diffusion,
+        dynamic.measurement,
+        meas_cov,
+        (sim_config.t_f - 0) / sim_config.n_meas,
+        means_gsf_init,
+        covs_gsf_init,
+        log_weights_gsf_init,
+        measurements,
+        sp,
+        constant_step_size=hgmf_config.constant_step_size,
+        rtol_pred=hgmf_config.rtol_pred,
+        atol_pred=hgmf_config.atol_pred,
+        rtol_hom=hgmf_config.rtol_hom,
+        atol_hom=hgmf_config.atol_hom,
+        dt_pred=hgmf_config.dt_pred,
+        dt_hom=hgmf_config.dt_hom,
+        use_log_homotopy=hgmf_config.use_log_homotopy,
+        log_homotopy_eps=hgmf_config.log_homotopy_eps,
+    ).compile()
+
+    start_hgmf = datetime.now()
+    hgmf_raw = compiled_hgmf(
+        dynamic.drift,
+        dynamic.diffusion,
+        dynamic.measurement,
+        meas_cov,
+        (sim_config.t_f - 0) / sim_config.n_meas,
+        means_gsf_init,
+        covs_gsf_init,
+        log_weights_gsf_init,
+        measurements,
+        sp,
+        constant_step_size=hgmf_config.constant_step_size,
+        rtol_pred=hgmf_config.rtol_pred,
+        atol_pred=hgmf_config.atol_pred,
+        rtol_hom=hgmf_config.rtol_hom,
+        atol_hom=hgmf_config.atol_hom,
+        dt_pred=hgmf_config.dt_pred,
+        dt_hom=hgmf_config.dt_hom,
+        use_log_homotopy=hgmf_config.use_log_homotopy,
+        log_homotopy_eps=hgmf_config.log_homotopy_eps,
+    )
+    hgmf_raw[0].block_until_ready()
+    finish_hgmf = datetime.now()
+    execution_time_hgmf = finish_hgmf - start_hgmf
+
+    # hgmf_raw = (means_hist, covs_hist, log_weights_hist, pred_sol, hom_sol)
+    means_hist, covs_hist, log_weights_hist, pred_sol, hom_sol = hgmf_raw
+
+    pred_ode_fn = create_hgmf_pred_ode_for_cost_analysis(dynamic.drift, dynamic.diffusion, sp)
+    hom_update_fn = create_hgmf_update_for_cost_analysis(
+        dynamic.measurement,
+        meas_cov,
+        rtol_hom=hgmf_config.rtol_hom,
+        atol_hom=hgmf_config.atol_hom,
+        dt_hom=hgmf_config.dt_hom,
+        use_log_homotopy=hgmf_config.use_log_homotopy,
+        log_homotopy_eps=hgmf_config.log_homotopy_eps,
+    )
+
+    hgmf_cost_analysis = compute_decomposed_flops_hgmf(
+        pred_ode_derivative_fn=pred_ode_fn,
+        sample_pred_states=(means_gsf_init, covs_gsf_init),
+        hom_update_fn=hom_update_fn,
+        sample_means=means_gsf_init,
+        sample_covs=covs_gsf_init,
+        sample_log_weights=log_weights_gsf_init,
+        sample_meas=measurements[0],
+        n_meas=sim_config.n_meas,
+        pred_sol_stats=pred_sol.stats,
+        hom_sol_stats=hom_sol.stats,
+    )
+
+    return (means_hist, covs_hist, log_weights_hist), hgmf_cost_analysis, execution_time_hgmf
